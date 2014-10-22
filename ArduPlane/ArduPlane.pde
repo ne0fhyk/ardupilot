@@ -1,6 +1,6 @@
 /// -*- tab-width: 4; Mode: C++; c-basic-offset: 4; indent-tabs-mode: nil -*-
 
-#define THISFIRMWARE "ArduPlane V3.1.0"
+#define THISFIRMWARE "ArduPlane V3.1.2beta1"
 /*
    Lead developer: Andrew Tridgell
  
@@ -280,6 +280,11 @@ static struct {
 // should throttle be pass-thru in guided?
 static bool guided_throttle_passthru;
 
+// are we doing calibration? This is used to allow heartbeat to
+// external failsafe boards during baro and airspeed calibration
+static bool in_calibration;
+
+
 ////////////////////////////////////////////////////////////////////////////////
 // GCS selection
 ////////////////////////////////////////////////////////////////////////////////
@@ -300,9 +305,16 @@ static AP_SpdHgtControl *SpdHgt_Controller = &TECS_controller;
 static AP_HAL::AnalogSource *rssi_analog_source;
 
 ////////////////////////////////////////////////////////////////////////////////
-// Sonar
+// rangefinder
 ////////////////////////////////////////////////////////////////////////////////
-static RangeFinder sonar;
+static RangeFinder rangefinder;
+
+static struct {
+    bool in_range;
+    float correction;
+    uint32_t last_correction_time_ms;
+    uint8_t in_range_count;
+} rangefinder_state;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Relay
@@ -502,7 +514,7 @@ static struct {
     int32_t hold_course_cd;
 
     // locked_course and locked_course_cd are used in stabilize mode 
-    // when ground steering is active
+    // when ground steering is active, and for steering in auto-takeoff
     bool locked_course;
     float locked_course_err;
 } steer_state = {
@@ -534,6 +546,9 @@ static struct {
     // in FBWA taildragger takeoff mode
     bool fbwa_tdrag_takeoff_mode:1;
 
+    // have we checked for an auto-land?
+    bool checked_for_autoland:1;
+
     // Altitude threshold to complete a takeoff command in autonomous modes.  Centimeters
     int32_t takeoff_altitude_cm;
 
@@ -552,6 +567,9 @@ static struct {
 
     // filtered sink rate for landing
     float land_sink_rate;
+
+    // time when we first pass min GPS speed on takeoff
+    uint32_t takeoff_speed_time_ms;
 } auto_state = {
     takeoff_complete : true,
     land_complete : false,
@@ -559,12 +577,14 @@ static struct {
     next_wp_no_crosstrack : true,
     no_crosstrack : true,
     fbwa_tdrag_takeoff_mode : false,
+    checked_for_autoland : false,
     takeoff_altitude_cm : 0,
     takeoff_pitch_cd : 0,
     highest_airspeed : 0,
     initial_pitch_cd : 0,
     next_turn_angle  : 90.0f,
-    land_sink_rate   : 0
+    land_sink_rate   : 0,
+    takeoff_speed_time_ms : 0
 };
 
 // true if we are in an auto-throttle mode, which means
@@ -783,7 +803,7 @@ static const AP_Scheduler::Task scheduler_tasks[] PROGMEM = {
     { compass_accumulate,     1,   1500 },
     { barometer_accumulate,   1,    900 },
     { update_notify,          1,    300 },
-    { read_sonars,            1,    500 },
+    { read_rangefinder,       1,    500 },
     { one_second_loop,       50,   1000 },
     { check_long_failsafe,   15,   1000 },
     { read_receiver_rssi,     5,   1000 },
@@ -875,6 +895,12 @@ static void ahrs_update()
     // calculate a scaled roll limit based on current pitch
     roll_limit_cd = g.roll_limit_cd * cosf(ahrs.pitch);
     pitch_limit_min_cd = aparm.pitch_limit_min_cd * fabsf(cosf(ahrs.roll));
+
+    // updated the summed gyro used for ground steering and
+    // auto-takeoff. Dot product of DCM.c with gyro vector gives earth
+    // frame yaw rate
+    steer_state.locked_course_err += ahrs.get_yaw_rate_earth() * G_Dt;
+    steer_state.locked_course_err = wrap_PI(steer_state.locked_course_err);
 }
 
 /*
@@ -1190,9 +1216,6 @@ static void handle_auto_mode(void)
             // during final approach constrain roll to the range
             // allowed for level flight
             nav_roll_cd = constrain_int32(nav_roll_cd, -g.level_roll_limit*100UL, g.level_roll_limit*100UL);
-            
-            // hold pitch above the specified land pitch in final approach
-            nav_pitch_cd = constrain_int32(nav_pitch_cd, g.land_pitch_cd, nav_pitch_cd);
         } else {
             if (!airspeed.use()) {
                 // when not under airspeed control, don't allow
@@ -1400,8 +1423,24 @@ static void update_navigation()
         update_commands();
         break;
             
-    case LOITER:
     case RTL:
+        if (g.rtl_autoland && 
+            !auto_state.checked_for_autoland &&
+            nav_controller->reached_loiter_target() && 
+            labs(altitude_error_cm) < 1000) {
+            // we've reached the RTL point, see if we have a landing sequence
+            if (!auto_state.checked_for_autoland &&
+                mission.jump_to_landing_sequence()) {
+                gcs_send_text_P(SEVERITY_LOW, PSTR("Starting auto landing"));
+                set_mode(AUTO);
+            }
+            // prevent running the expensive jump_to_landing_sequence
+            // on every loop
+            auto_state.checked_for_autoland = true;
+        }
+        // fall through to LOITER
+
+    case LOITER:
     case GUIDED:
         // allow loiter direction to be changed in flight
         if (g.loiter_radius < 0) {

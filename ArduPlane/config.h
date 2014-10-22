@@ -428,7 +428,7 @@
 // Navigation defaults
 //
 #ifndef WP_RADIUS_DEFAULT
- # define WP_RADIUS_DEFAULT              30
+ # define WP_RADIUS_DEFAULT              90
 #endif
 
 #ifndef LOITER_RADIUS_DEFAULT
@@ -493,6 +493,12 @@
  # define OBC_FAILSAFE DISABLED
 #endif
 #endif
+
+#if OBC_FAILSAFE == ENABLED && HAL_CPU_CLASS < HAL_CPU_CLASS_75
+#define CLI_ENABLED DISABLED
+#endif
+
+
 
 #ifndef SERIAL_BUFSIZE
  # define SERIAL_BUFSIZE 512
